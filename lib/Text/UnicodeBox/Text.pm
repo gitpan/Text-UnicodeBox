@@ -12,9 +12,11 @@ This module is part of the low level interface to L<Text::UnicodeBox>; you proba
 
 use Moose;
 use Text::UnicodeBox::Utility;
-use Text::CharWidth qw(mbswidth);
+use Text::CharWidth qw(mbwidth mbswidth);
 use Term::ANSIColor qw(colorstrip);
 use Exporter 'import';
+use List::Util qw(max);
+use utf8;
 
 =head1 METHODS
 
@@ -36,6 +38,10 @@ How many characters wide the text represents when rendered on the screen.
 
 has 'value'    => ( is => 'rw' );
 has 'length'   => ( is => 'rw' );
+has 'line_count' => ( is => 'rw', default => 1 );
+has 'longest_word_length' => ( is => 'ro', lazy => 1, builder => '_build_longest_word_length' );
+has '_lines'   => ( is => 'rw' );
+has '_longest_line_length' => ( is => 'rw' );
 
 our @EXPORT_OK = qw(BOX_STRING);
 our %EXPORT_TAGS = ( all => [@EXPORT_OK] );
@@ -141,6 +147,234 @@ Returns the value of this object.
 sub to_string {
 	my $self = shift;
 	return $self->value;
+}
+
+## _build_longest_word_length
+#
+#  In order to find ideal widths of a wrapped column without breaking words, it's necessary to know the longest word length in the string.
+
+sub _build_longest_word_length {
+	my $self = shift;
+
+	my $longest_word = 0;
+	foreach my $word (split / /, $self->value) {
+		my $obj = BOX_STRING($word);
+		$longest_word = max($obj->length, $longest_word);
+	}
+	
+	return $longest_word;
+}
+
+=head2 lines
+
+Return array of objects of this string split into new strings on the newline character
+
+=cut
+
+sub lines {
+	my $self = shift;
+	$self->_split_up_on_newline();
+	if ($self->_lines) {
+		return @{ $self->_lines };
+	}
+	else {
+		return $self;
+	}
+}
+
+=head2 line_count
+
+Provides the count of C<lines()>
+
+=head2 longest_line_length
+
+Return the length of the longest line in C<lines()>
+
+=cut
+
+sub longest_line_length {
+	my $self = shift;
+	$self->_split_up_on_newline();
+	return $self->_longest_line_length;
+}
+
+## _split_up_on_newline
+#
+#  Populate _lines, line_count and _longest_line_length
+
+sub _split_up_on_newline {
+	my $self = shift;
+
+	# Don't repeat work
+	return if defined $self->_longest_line_length;
+
+	my (@lines, $longest_line);
+	foreach my $line (split /\n/, $self->value) {
+		my $obj = BOX_STRING($line);
+		push @lines, $obj;
+		$longest_line = max($obj->length, $longest_line || 0);
+	}
+	
+	$self->_longest_line_length($longest_line || 0);
+	$self->_lines(\@lines);
+	$self->line_count(int @lines);
+}
+
+=head2 split (%args)
+
+  my @segments = $obj->split( max_width => 100, break_words => 1 );
+
+Return array of objects of this string split at the max width given.  If break_words => 1, break anywhere, otherwise only break on the space character.
+
+=cut
+
+sub split {
+	my ($self, %args) = @_;
+	my $class = ref $self;
+
+	my @segments;
+	my $value = $self->value;
+
+	my $width = 0;
+	my $buffer = '';
+	my $color_state_tracker = _color_state_tracker();
+	my $save_buffer = sub {
+		my $esc = chr(27);
+		$buffer .= $esc . '[0m' if $color_state_tracker->{is_colored}->();
+
+		# If the string is split at a boundary between different color codes, you may get
+		# a series of redundant reset statements
+		$buffer =~ s/$esc\[\d+m $esc\[0m/$esc\[0m/gx;
+		$buffer =~ s/^$esc\[0m//;
+
+		push @segments, $class->new(value => $buffer, length => $width);
+		$buffer = '';
+		$width = 0;
+		$buffer .= $color_state_tracker->{stringify_states}->();
+	};
+
+	my $add_char = sub {
+		my ($char, $value_ref) = @_;
+		my $ord = ord($char);
+
+		# Check for a color escape sequence
+		if ($ord == 27 && $$value_ref =~ m{^\[(\d+)m}) {
+			my $color_state = $1 * 1;
+			$$value_ref =~ s{^\[\d+m}{};
+			$buffer .= $char . "[${color_state}m";
+
+			$color_state_tracker->{add_state}->($color_state);
+			return;
+		}
+		
+		my $char_width = mbwidth($char);
+		$save_buffer->() if $char_width + $width > $args{max_width};
+
+		$buffer .= $char;
+		$width += $char_width;
+		$save_buffer->() if $width == $args{max_width};
+	};
+
+	my $character_by_character = $args{break_words} ? 1 : 0;
+
+	while (length $value) {
+		if ($character_by_character) {
+			my $char = substr $value, 0, 1, '';
+			$add_char->($char, \$value);
+		}
+		else {
+			# Extract the next word, up to a space
+			my $word;
+			my $next_space_index = index $value, ' ';
+			while ($next_space_index == 0) {
+				# Value currently starts with a space; write each space out
+				$add_char->( substr($value, 0, 1, ''), \$value );
+				$next_space_index = index $value, ' ';
+			}
+			if ($next_space_index > 0) {
+				$word = substr $value, 0, $next_space_index, '';
+			}
+			if ($word) {
+				# Wrap to the next line if the current line can't hold this word
+				my $word_width = mbswidth($word);
+				$save_buffer->() if $word_width + $width > $args{max_width};
+
+				# Write out the word, character by character
+				while (length $word) {
+					my $char = substr $word, 0, 1, '';
+					$add_char->($char, \$word);
+				}
+			}
+			else {
+				# No word found; write out the rest of the string character by character
+				$character_by_character = 1;
+			}
+		}
+	}
+	$save_buffer->();
+
+	return @segments;
+}
+
+## _color_state_tracker
+#
+#  Pass in a numerical ANSI color escape and it'll track what the cumulative state is over time
+
+sub _color_state_tracker {
+	my %color_state;
+	my %set_order;
+	my $set_count = 0;
+
+	return {
+		is_colored => sub {
+			return keys %color_state ? 1 : 0;
+		},
+		add_state => sub {
+			my $color_state = shift;
+			my $type;
+			# 0 is the reset code
+			if ($color_state == 0) {
+				%color_state = ();
+				return;
+			}
+			elsif ($color_state == 1 || $color_state == 22) {
+				$type = 'bold';
+			}
+			elsif ($color_state == 3 || $color_state == 23) {
+				$type = 'italics';
+			}
+			elsif ($color_state == 4 || $color_state == 24) {
+				$type = 'underline';
+			}
+			elsif ($color_state == 7 || $color_state == 27) {
+				$type = 'inverse';
+			}
+			elsif ($color_state == 9 || $color_state == 29) {
+				$type = 'strikethrough';
+			}
+			elsif ($color_state >= 30 || $color_state <= 39) {
+				$type = 'foreground';
+			}
+			elsif ($color_state >= 40 || $color_state <= 49) {
+				$type = 'background';
+			}
+			return unless $type;
+
+			if ($color_state >= 20 && $color_state <= 29) {
+				delete $color_state{$type};
+				delete $set_order{$type};
+			}
+			else {
+				$color_state{$type} = $color_state;
+				$set_order{$type} = ++$set_count;
+			}
+		},
+		stringify_states => sub {
+			return join '', map { chr(27) . "[$color_state{$_}m" }
+				sort { $set_order{$a} <=> $set_order{$b} }
+				keys %color_state;
+		},
+	};
 }
 
 =head1 COPYRIGHT

@@ -32,18 +32,42 @@ This module provides an easy high level interface over L<Text::UnicodeBox>.
 use Moose;
 use Text::UnicodeBox::Text qw(:all);
 use Text::UnicodeBox::Control qw(:all);
+use List::Util qw(sum max);
 extends 'Text::UnicodeBox';
 
 has 'lines'             => ( is => 'rw', default => sub { [] } );
 has 'max_column_widths' => ( is => 'rw', default => sub { [] } );
 has 'style'             => ( is => 'rw', default => 'light' );
 has 'is_rendered'       => ( is => 'rw' );
+has 'split_lines'       => ( is => 'ro' );
+has 'max_width'         => ( is => 'ro' );
+has 'column_widths'     => ( is => 'rw' );
+has 'break_words'       => ( is => 'ro' );
 
 =head1 METHODS
 
 =head2 new
 
 =over 4
+
+=item split_lines
+
+If set, line breaks in cell data will result in new rows rather then breaks in the rendering.
+
+=item max_width
+
+If set, the width of the table will ever exceed the given width.  Data will be attempted to fit with wrapping at word boundaries.
+
+=item break_words
+
+If set, wrapping may break words
+
+=item column_widths
+
+  column_widths => [ undef, 40, 60 ],
+  # First column may be any width but the second and third have specified widths
+
+Specify the exact width of each column, sans padding and box formatting.
 
 =item style
 
@@ -162,22 +186,32 @@ around 'render' => sub {
 
 	my @alignment;
 
-	my @lines = @{ $self->lines };
-	foreach my $i (0..$#lines) {
-		my ($opts, $columns) = @{ $lines[$i] };
+	my $lines             = $self->lines;
+	my $max_column_widths = $self->max_column_widths;
+
+	if ($self->_is_width_constrained || $self->split_lines) {
+		if ($self->max_width && ! $self->column_widths) {
+			$self->_determine_column_widths();
+		}
+		($lines, $max_column_widths) = $self->_fit_lines_to_widths($lines);
+	}
+
+	my $last_line_index = $#{ $lines };
+	foreach my $i (0..$last_line_index) {
+		my ($opts, $columns) = @{ $lines->[$i] };
 		my %start = (
 			style => $opts->{style} || 'light',
 		);
 		if ($opts->{header} || $i == 0 || $opts->{top}) {
 			$start{top} = $opts->{top} || $start{style};
 		}
-		if ($opts->{header} || $i == $#lines || $opts->{bottom}) {
+		if ($opts->{header} || $i == $last_line_index || $opts->{bottom}) {
 			$start{bottom} = $opts->{bottom} || $start{style};
 		}
 
 		# Support special table-wide styles
 		if ($self->style) {
-			if ($self->style eq 'horizontal_double' && $i == $#lines) {
+			if ($self->style eq 'horizontal_double' && $i == $last_line_index) {
 				$start{bottom} = 'double';
 			}
 		}
@@ -188,8 +222,10 @@ around 'render' => sub {
 
 		my @parts = ( BOX_START(%start) );
 		foreach my $j (0..$#{$columns}) {
-			my $align = $opts->{header_alignment} ? $opts->{header_alignment}[$j] : $opts->{header} ? 'left' : $alignment[$j] || undef;
-			push @parts, $columns->[$j]->align_and_pad(width => $self->max_column_widths->[$j], align => $align);
+			my $align = $opts->{header_alignment} ? $opts->{header_alignment}[$j]
+					  : $opts->{header}           ? 'left'
+					  : $alignment[$j] || undef;
+			push @parts, $columns->[$j]->align_and_pad(width => $max_column_widths->[$j], align => $align);
 			if ($j != $#{$columns}) {
 				push @parts, BOX_RULE;
 			}
@@ -207,17 +243,194 @@ around 'render' => sub {
 sub _push_line {
 	my ($self, $opt, @columns) = @_;
 
+	# Allow undef to be passed in columns; map it to ''
+	$columns[$_] = '' foreach grep { ! defined $columns[$_] } 0..$#columns;
+
+	my $do_split_lines = defined $opt->{split_lines} ? $opt->{split_lines} : $self->split_lines;
+
 	# Convert each column into a ::Text object so that I can figure out the length as
 	# well as record max column widths
 	my @strings;
 	foreach my $i (0..$#columns) {
 		my $string = BOX_STRING($columns[$i]);
+		my $string_length = $string->length;
 		push @strings, $string;
-		$self->max_column_widths->[$i] = $string->length
-			if ! $self->max_column_widths->[$i] || $self->max_column_widths->[$i] < $string->length;
+
+		if ($do_split_lines && $columns[$i] =~ m/\n/) {
+			# Asking for the longest_line_length will automatically split the string on newlines
+			$string_length = $string->longest_line_length;
+		}
+
+		# Update record of max column widths
+		$self->max_column_widths->[$i] = max($string_length, $self->max_column_widths->[$i] || 0);
 	}
 
 	push @{ $self->lines }, [ $opt, \@strings ];
+}
+
+sub _is_width_constrained {
+	my $self = shift;
+	return $self->max_width || $self->column_widths;
+}
+
+## _determine_column_widths
+#
+# Pass no args, return nothing.  Figure out what the column widths should be where the caller has specified a custom max_width value that they'd like the whole table to be constrained to.
+
+sub _determine_column_widths {
+	my $self = shift;
+	return if $self->column_widths;
+	return if ! $self->max_width;
+
+	# Max width represents the max width of the rendered table, with padding and box characters
+	# Let's figure out how many characters will be used for rendering and padding
+	my $column_count = int @{ $self->max_column_widths };
+	my $padding_width = 1;
+	my $rendering_characters_width =
+		($column_count * ($padding_width * 2)) # space on left and right of each cell text
+		+ $column_count + 1;                   # bars on right of each column + one on left in beginning
+
+	# Prepare a checker for determining success
+	my $widths_over = sub {
+		my @column_widths = @_;
+		return (sum (@column_widths) + $rendering_characters_width) - $self->max_width;
+	};
+	my $widths_fit = sub {
+		my @column_widths = @_;
+		if ($widths_over->(@column_widths) <= 0) {
+			$self->column_widths( \@column_widths );
+			return 1;
+		}
+		return 0;
+	};
+
+	# Escape early if the max column widths already fit the constraint
+	return if $widths_fit->(@{ $self->max_column_widths });
+
+	# FIXME
+	if ($self->break_words) {
+		die "Passing max_width and break_words without column_widths is not yet implemented\n";
+	}
+
+	# Figure out longest word lengths
+	my @longest_word_lengths;
+	foreach my $line (@{ $self->lines }) {
+		foreach my $column_index (0..$#{ $line->[1] }) {
+			my $length = $line->[1][$column_index]->longest_word_length;
+			$longest_word_lengths[$column_index] = max($length, $longest_word_lengths[$column_index] || 0);
+		}
+	}
+
+	# Sanity check about if it's even possible to proceed
+	if ($widths_over->(@longest_word_lengths) > 0) {
+		die "It's not possible to fit the table in width ".$self->max_width." without break_words => 1\n";
+	}
+
+	# Reduce the amout of wrapping as much as possible.  Try and fit in the max_width with breaking the
+	# fewest possible columns.
+
+	my @column_widths = @{ $self->max_column_widths };
+	my @column_index_by_width = sort { $column_widths[$b] <=> $column_widths[$a] } 0..$#column_widths;
+
+	while (! $widths_fit->(@column_widths)) {
+		# Select the next widest column and try shortening it
+		my $column_index = shift @column_index_by_width;
+		if (! defined $column_index) {
+			die "Shortened all the columns and found no way to fit";
+		}
+
+		my $overage = $widths_over->(@column_widths);
+		my $new_width = $column_widths[$column_index] - $overage;
+		if ($new_width < $longest_word_lengths[$column_index]) {
+			$new_width = $longest_word_lengths[$column_index];
+		}
+		$column_widths[$column_index] = $new_width;
+	}
+
+	return;
+}
+
+## _fit_lines_to_widths (\@lines, \@column_widths)
+#
+#  Pass an array ref of lines (most likely from $self->lines).  Return an array ref of lines wrapped to the $self->column_widths values, and an array ref of the new max column widths.
+
+sub _fit_lines_to_widths {
+	my ($self, $lines, @column_widths) = @_;
+
+	@column_widths = @{ $self->column_widths } if ! @column_widths && $self->column_widths;
+	@column_widths = @{ $self->max_column_widths } if ! @column_widths;
+	if (! @column_widths) {
+		die "Can't call _fit_lines_to_widths() without column_widths set or passed";
+	}
+	my @max_column_widths;
+
+	my @new_lines;
+	foreach my $line (@$lines) {
+		my ($opts, $strings) = @$line;
+		my @new_line;
+		foreach my $column_index (0..$#column_widths) {
+			my $string = $strings->[$column_index];
+			my $width  = $column_widths[$column_index];
+
+			# As long as this string doesn't span multiple lines, and
+			# if no width constraint or if this string already fits, store and move on
+			if ($string->line_count == 1 && (! $width || $string->length <= $width)) {
+				$new_line[0][$column_index] = $string;
+				next;
+			}
+
+			my ($store_buffer, $add_string_to_buffer);
+			{
+				my $row_index = 0;
+				my $length = 0;
+				my $buffer = '';
+				$store_buffer = sub {
+					return unless $length;
+					$new_line[$row_index++][$column_index] = BOX_STRING($buffer);
+					$length = 0;
+					$buffer = '';
+				};
+				$add_string_to_buffer = sub {
+					my ($word_value, $word_length) = @_;
+					if ($width && $length + $word_length > $width) {
+						$store_buffer->();
+					}
+					$buffer .= $word_value;
+					$length += $word_length;
+				};
+			}
+
+			foreach my $line ($string->lines) {
+
+				# If no width constraint or if this string already fits, store and move on
+				if (! $width || $line->length <= $width) {
+					$add_string_to_buffer->($line->value, $line->length);
+					$store_buffer->();
+					next;
+				}
+
+				foreach my $segment ($line->split( break_words => $self->break_words, max_width => $width )) {
+					$add_string_to_buffer->($segment->value, $segment->length);
+					$store_buffer->();
+				}
+				next;
+			}
+		}
+		foreach my $row_index (0..$#new_line) {
+			# Every cell needs to have a string object
+			foreach my $column_index (0..$#column_widths) {
+				$new_line[$row_index][$column_index] ||= BOX_STRING('');
+
+				# Update max_column_widths
+				my $width = $new_line[$row_index][$column_index]->length;
+				$max_column_widths[$column_index] = $width
+					if ! $max_column_widths[$column_index] || $max_column_widths[$column_index] < $width;
+			}
+			push @new_lines, [ $opts, $new_line[$row_index] ];
+		}
+	}
+
+	return (\@new_lines, \@max_column_widths);
 }
 
 =head2 output_width
@@ -234,6 +447,11 @@ sub output_width {
 	foreach my $column_width (@{ $self->max_column_widths }) {
 		$width += $column_width + 3; # 2: padding, 1: trailing pipe char
 	}
+
+	if ($self->max_width && $width > $self->max_width) {
+		return $self->max_width; # FIXME: is this relastic?  What about for very small values of max_width and large count of columns?
+	}
+
 	return $width;
 }
 

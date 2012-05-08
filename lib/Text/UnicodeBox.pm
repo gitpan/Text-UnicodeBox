@@ -47,7 +47,7 @@ has 'buffer_ref' => ( is => 'rw', default => sub { my $buffer = '';  return \$bu
 has 'last_line'  => ( is => 'rw' );
 has 'whitespace_character' => ( is => 'ro', default => ' ' );
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 =head1 METHODS
 
@@ -238,6 +238,10 @@ sub _generate_box_border_line {
 
 	return $line;
 }
+
+=head1 DEVELOPMENT
+
+This module is being developed via a git repository publicly avaiable at http://github.com/ewaters/Text-UnicodeBox.  I encourage anyone who is interested to fork my code and contribute bug fixes or new features, or just have fun and be creative.
 
 =head1 COPYRIGHT
 

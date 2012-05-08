@@ -2,10 +2,15 @@ use strict;
 use warnings;
 use utf8;
 use Test::More;
+use Text::CharWidth qw(mbwidth);
 
 BEGIN {
 	use_ok 'Text::UnicodeBox::Table';
 };
+
+# If LC_ environment variables can't see this string encoded in the proper format (i.e., called in a server context with no controlling terminal),
+# then this module can't operate with Unicode or UTF-8 encoded strings.
+my $skip_unicode_tests = mbwidth("象") == 2 ? 0 : 1;
 
 $Text::UnicodeBox::Utility::report_on_failure = 1;
 
@@ -85,13 +90,14 @@ is "\n" . $table->render, <<END_BOX, "Lines in between rows";
 ╘════╧═════════════════════╧═════════════════════╛
 END_BOX
 
-$table = Text::UnicodeBox::Table->new();
+if (! $skip_unicode_tests) {
+	$table = Text::UnicodeBox::Table->new();
 
-$table->add_header({ top => 'double', bottom => 'double' }, @columns);
-$table->add_row(1, '2012-04-16 12:34:16', '象形文字象形文字');
-$table->add_row({ bottom => 'double' }, @{ $rows[1] });
+	$table->add_header({ top => 'double', bottom => 'double' }, @columns);
+	$table->add_row(1, '2012-04-16 12:34:16', "象形文字象形文字");
+	$table->add_row({ bottom => 'double' }, @{ $rows[1] });
 
-is "\n" . $table->render, <<END_BOX, "Unicode table data";
+	is "\n" . $table->render, <<END_BOX, "Unicode table data";
 
 ╒════╤═════════════════════╤══════════════════╕
 │ id │ ts                  │ log              │
@@ -100,6 +106,7 @@ is "\n" . $table->render, <<END_BOX, "Unicode table data";
 │  2 │ 2012-04-16 16:30:43 │ Eric was here    │
 ╘════╧═════════════════════╧══════════════════╛
 END_BOX
+}
 
 $table = Text::UnicodeBox::Table->new( style => 'horizontal_double' );
 
