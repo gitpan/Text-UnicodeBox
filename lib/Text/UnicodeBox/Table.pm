@@ -39,14 +39,16 @@ has 'lines'             => ( is => 'rw', default => sub { [] } );
 has 'max_column_widths' => ( is => 'rw', default => sub { [] } );
 has 'style'             => ( is => 'rw', default => 'light' );
 has 'is_rendered'       => ( is => 'rw' );
-has 'split_lines'       => ( is => 'ro' );
-has 'max_width'         => ( is => 'ro' );
+has 'split_lines'       => ( is => 'rw' );
+has 'max_width'         => ( is => 'rw' );
 has 'column_widths'     => ( is => 'rw' );
-has 'break_words'       => ( is => 'ro' );
+has 'break_words'       => ( is => 'rw' );
 
 =head1 METHODS
 
 =head2 new
+
+Pass any arguments you would to L<Text::UnicodeBox/new> but with the following additions.
 
 =over 4
 
@@ -225,7 +227,12 @@ around 'render' => sub {
 			my $align = $opts->{header_alignment} ? $opts->{header_alignment}[$j]
 					  : $opts->{header}           ? 'left'
 					  : $alignment[$j] || undef;
-			push @parts, $columns->[$j]->align_and_pad(width => $max_column_widths->[$j], align => $align);
+
+			push @parts, $columns->[$j]->align_and_pad(
+				width => $max_column_widths->[$j],
+				align => $align,
+			);
+
 			if ($j != $#{$columns}) {
 				push @parts, BOX_RULE;
 			}
@@ -309,7 +316,7 @@ sub _determine_column_widths {
 
 	# FIXME
 	if ($self->break_words) {
-		die "Passing max_width and break_words without column_widths is not yet implemented\n";
+		warn "Passing max_width and break_words without column_widths is not yet implemented\n";
 	}
 
 	# Figure out longest word lengths
@@ -449,7 +456,7 @@ sub output_width {
 	}
 
 	if ($self->max_width && $width > $self->max_width) {
-		return $self->max_width; # FIXME: is this relastic?  What about for very small values of max_width and large count of columns?
+		return $self->max_width; # FIXME: is this realistic?  What about for very small values of max_width and large count of columns?
 	}
 
 	return $width;
